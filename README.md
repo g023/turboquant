@@ -26,3 +26,25 @@ pip install transformers datasets scipy
 1) Download the model files and throw in ./Qwen3-BEST
 2) Install pre-reqs
 3) Run run_tquant.py to see it in action
+
+
+# results:
+~~~
+------------------------------------------------------------
+Results:
+  Total tokens: 1509
+  Time: 26.23s
+  Tokens/sec: 57.53
+
+  TurboQuant Memory Report:
+    Sequence length:    1223
+    Compressed tokens:  771
+    Buffer tokens:      452
+    Compressed layers:  24
+    Full prec. layers:  5
+    Actual KV cache:    89.41 MB
+    Full precision:     138.54 MB
+    Compression ratio:  1.55x
+    Savings:            49.13 MB
+------------------------------------------------------------
+~~~
