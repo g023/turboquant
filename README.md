@@ -14,10 +14,15 @@ Algorithms:
   3. QJL sign-bit residual correction → unbiased inner products
   4. Group quantization for values → per-group min-max
 
-Model Repo: https://huggingface.co/g023/Qwen3-1.77B-g023
+Model Repo: [ https://huggingface.co/g023/Qwen3-1.77B-g023 ]
 Model Info: (head_dim=128, 8 KV heads, 29 layers, GQA)
 Model Instructions: Download files from MODEL REPO and throw in ./Qwen3-BEST and then run this program. 
 
 Reqs:
 pip install transformers datasets scipy
 ~~~
+
+# instructions:
+1) Download the model files and throw in ./Qwen3-BEST
+2) Install pre-reqs
+3) Run run_tquant.py to see it in action
