@@ -1,0 +1,3 @@
+Download all the files for the model from https://huggingface.co/g023/Qwen3-1.77B-g023/tree/main and place them in this folder.
+Then go back up a dir and run run_tquant.py
+
