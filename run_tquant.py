@@ -14,7 +14,7 @@ Algorithms:
 
 Model Repo: https://huggingface.co/g023/Qwen3-1.77B-g023
 Model Info: (head_dim=128, 8 KV heads, 29 layers, GQA)
-Model Instructions: Download files from MODEL REPO and throw in ./Qwen3-BEST and then run this program. 
+Model Instructions: Download files from 'MODEL REPO' and throw in ./Qwen3-BEST and then run this program. 
 
 Reqs:
 pip install transformers datasets scipy
@@ -30,7 +30,12 @@ import torch
 import torch.nn.functional as F
 from io import StringIO
 from typing import Optional, NamedTuple
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer, DynamicCache
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+from transformers.cache_utils import Cache, CacheLayerMixin, DynamicLayer
+
+# force clear cache
+torch.cuda.empty_cache()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -38,10 +43,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer, Dyna
 
 MODEL_PATH = "./Qwen3-BEST"
 MAX_NEW_TOKENS = 8192
-TEMPERATURE = 0.7
+TEMPERATURE = 0.6
 DO_SAMPLE = True
-TOP_P = 0.9
-TOP_K = 50
+TOP_P = 0.95
+TOP_K = 20
 REPETITION_PENALTY = 1.1
 INPUT_MESSAGE = (
     "You are completing the next step in a task to create an arcade game in javascript. "
@@ -445,182 +450,250 @@ def concat_value_q(a, b):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Section 9: TurboQuantCache (DynamicCache subclass)
+# Section 9: TurboQuantLayer & TurboQuantCache (transformers 5.0+ Cache API)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TurboQuantCache(DynamicCache):
+class TurboQuantLayer(CacheLayerMixin):
     """
-    HuggingFace DynamicCache with TurboQuant KV compression.
+    A cache layer with TurboQuant KV compression.
 
-    - Keys: TurboQuantProd (unbiased inner-product, 3-bit default)
-    - Values: Group quantization (4-bit default)
+    - Keys: TurboQuantProd (unbiased inner-product quantization)
+    - Values: Group quantization (asymmetric min-max)
     - Buffer: Recent tokens kept in full precision
 
-    Memory savings are realized between generation steps:
-    only compressed data + small buffer persist in GPU memory.
-    Full tensors are temporary during each attention computation.
+    The layer transparently compresses older tokens while returning
+    full-precision tensors to the attention computation.
     """
 
-    def __init__(self, head_dim, num_layers, key_bits=3, value_bits=4,
-                 buffer_size=128, value_group_size=32,
-                 skip_first_layers=0, skip_last_layers=0):
-        super().__init__()
-        self.key_cache = [[] for _ in range(num_layers)]
-        self.value_cache = [[] for _ in range(num_layers)]
-        self._seen_tokens = 0
+    is_sliding = False
 
+    def __init__(self, head_dim, key_bits=4, value_bits=4,
+                 buffer_size=256, value_group_size=32, seed=42):
+        super().__init__()
         self.head_dim = head_dim
         self.key_bits = key_bits
         self.value_bits = value_bits
         self.buffer_size = buffer_size
         self.value_group_size = value_group_size
-        self.num_layers = num_layers
-        self.skip_first = skip_first_layers
-        self.skip_last = skip_last_layers
+        self.layer_seed = seed
 
-        # Layers to compress (skip first/last for quality)
-        self._compress_layers = set(
-            range(skip_first_layers, num_layers - skip_last_layers)
-        )
+        # Compressed storage (initialized on first flush)
+        self._comp_keys = None
+        self._comp_values = None
+        self._comp_len = 0
 
-        # Per-layer quantizers (lazy-initialized on first use)
-        self._quantizers = {}
-        # Per-layer compressed storage
-        self._comp_keys = {}
-        self._comp_values = {}
-        self._comp_lens = {}
+        # Quantizer (lazy-initialized on first use)
+        self._quantizer = None
 
-    def _quantizer(self, layer_idx, device):
-        """Get or create quantizer for a layer."""
-        if layer_idx not in self._quantizers:
-            self._quantizers[layer_idx] = TurboQuantProd(
+    def lazy_initialization(self, key_states, value_states):
+        self.dtype = key_states.dtype
+        self.device = key_states.device
+        self.keys = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.is_initialized = True
+
+    def _get_quantizer(self, device):
+        """Get or create quantizer for this layer."""
+        if self._quantizer is None:
+            self._quantizer = TurboQuantProd(
                 dim=self.head_dim, bits=self.key_bits,
-                device=device, seed=42 + layer_idx * 7,
+                device=device, seed=self.layer_seed,
             )
-        return self._quantizers[layer_idx]
+        return self._quantizer
 
-    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+    def update(self, key_states, value_states, cache_kwargs=None):
         """
         Append new KV states, compress if buffer overflows, return full sequence.
-        key_states/value_states: (batch, num_kv_heads, new_tokens, head_dim)
-        Returns: (full_keys, full_values) for attention computation.
+        Returns: (full_keys, full_values) with decompressed + buffer tokens.
         """
-        if layer_idx == 0:
-            self._seen_tokens += key_states.shape[-2]
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
 
         # Append to buffer
-        kc = self.key_cache[layer_idx]
-        if isinstance(kc, list) and len(kc) == 0:
-            self.key_cache[layer_idx] = key_states
-            self.value_cache[layer_idx] = value_states
+        if self.keys.numel() == 0:
+            self.keys = key_states
+            self.values = value_states
         else:
-            self.key_cache[layer_idx] = torch.cat([kc, key_states], dim=-2)
-            self.value_cache[layer_idx] = torch.cat(
-                [self.value_cache[layer_idx], value_states], dim=-2
-            )
+            self.keys = torch.cat([self.keys, key_states], dim=-2)
+            self.values = torch.cat([self.values, value_states], dim=-2)
 
-        # Flush if buffer exceeds 2x target size (only for compressed layers)
-        buf_len = self.key_cache[layer_idx].shape[-2]
-        if layer_idx in self._compress_layers and buf_len > self.buffer_size * 2:
-            self._flush(layer_idx)
+        # Flush if buffer exceeds 2x target size
+        buf_len = self.keys.shape[-2]
+        if buf_len > self.buffer_size * 2:
+            self._flush()
 
         # Return full decompressed + buffer for this step's attention
-        return self._full_keys(layer_idx), self._full_values(layer_idx)
+        return self._full_keys(), self._full_values()
 
-    def _flush(self, layer_idx):
+    def _flush(self):
         """Compress oldest buffer tokens into compressed storage."""
-        buf_k = self.key_cache[layer_idx]
-        buf_v = self.value_cache[layer_idx]
-        n_flush = buf_k.shape[-2] - self.buffer_size
+        n_flush = self.keys.shape[-2] - self.buffer_size
 
-        to_k = buf_k[..., :n_flush, :]
-        to_v = buf_v[..., :n_flush, :]
+        to_k = self.keys[..., :n_flush, :]
+        to_v = self.values[..., :n_flush, :]
 
         # Keep only recent tokens in buffer
-        self.key_cache[layer_idx] = buf_k[..., n_flush:, :].contiguous()
-        self.value_cache[layer_idx] = buf_v[..., n_flush:, :].contiguous()
+        self.keys = self.keys[..., n_flush:, :].contiguous()
+        self.values = self.values[..., n_flush:, :].contiguous()
 
         # Quantize the flushed tokens
-        q = self._quantizer(layer_idx, to_k.device)
+        q = self._get_quantizer(to_k.device)
         new_kq = q.quantize(to_k)
         new_vq = quantize_values(to_v, self.value_bits, self.value_group_size)
 
         # Merge with existing compressed storage
-        if layer_idx in self._comp_keys:
-            self._comp_keys[layer_idx] = concat_prod_q(
-                self._comp_keys[layer_idx], new_kq
-            )
-            self._comp_values[layer_idx] = concat_value_q(
-                self._comp_values[layer_idx], new_vq
-            )
-            self._comp_lens[layer_idx] += n_flush
+        if self._comp_keys is not None:
+            self._comp_keys = concat_prod_q(self._comp_keys, new_kq)
+            self._comp_values = concat_value_q(self._comp_values, new_vq)
+            self._comp_len += n_flush
         else:
-            self._comp_keys[layer_idx] = new_kq
-            self._comp_values[layer_idx] = new_vq
-            self._comp_lens[layer_idx] = n_flush
+            self._comp_keys = new_kq
+            self._comp_values = new_vq
+            self._comp_len = n_flush
 
-    def _full_keys(self, layer_idx):
+    def _full_keys(self):
         """Decompress compressed keys + concat with buffer."""
-        buf = self.key_cache[layer_idx]
-        if layer_idx not in self._comp_keys:
-            return buf
-        q = self._quantizer(layer_idx, buf.device)
-        decompressed = q.dequantize(self._comp_keys[layer_idx]).to(buf.dtype)
-        return torch.cat([decompressed, buf], dim=-2)
+        if self._comp_keys is None:
+            return self.keys
+        q = self._get_quantizer(self.keys.device)
+        decompressed = q.dequantize(self._comp_keys).to(self.keys.dtype)
+        return torch.cat([decompressed, self.keys], dim=-2)
 
-    def _full_values(self, layer_idx):
+    def _full_values(self):
         """Dequantize compressed values + concat with buffer."""
-        buf = self.value_cache[layer_idx]
-        if layer_idx not in self._comp_values:
-            return buf
+        if self._comp_values is None:
+            return self.values
         decompressed = dequantize_values(
-            self._comp_values[layer_idx], self.value_group_size
-        ).to(buf.dtype)
-        return torch.cat([decompressed, buf], dim=-2)
+            self._comp_values, self.value_group_size
+        ).to(self.values.dtype)
+        return torch.cat([decompressed, self.values], dim=-2)
 
-    def get_seq_length(self, layer_idx=0):
+    def get_seq_length(self):
         """Total sequence length = compressed tokens + buffer tokens."""
-        if layer_idx >= len(self.key_cache):
+        if not self.is_initialized or self.keys.numel() == 0:
             return 0
-        kc = self.key_cache[layer_idx]
-        if isinstance(kc, list) and len(kc) == 0:
-            return 0
-        buf_len = kc.shape[-2]
-        return self._comp_lens.get(layer_idx, 0) + buf_len
+        return self._comp_len + self.keys.shape[-2]
+
+    def get_mask_sizes(self, cache_position):
+        kv_offset = 0
+        query_length = cache_position.shape[0]
+        kv_length = self.get_seq_length() + query_length
+        return kv_length, kv_offset
+
+    def get_max_cache_shape(self):
+        return -1
+
+    def crop(self, max_length):
+        if max_length < 0:
+            max_length = self.get_seq_length() - abs(max_length)
+        if self.get_seq_length() <= max_length:
+            return
+        # For crop, decompress everything and truncate, then re-init
+        # This is rare (beam search), keep simple
+        if self._comp_keys is not None:
+            full_k = self._full_keys()[..., :max_length, :]
+            full_v = self._full_values()[..., :max_length, :]
+            self.keys = full_k
+            self.values = full_v
+            self._comp_keys = None
+            self._comp_values = None
+            self._comp_len = 0
+        else:
+            self.keys = self.keys[..., :max_length, :]
+            self.values = self.values[..., :max_length, :]
+
+    def reset(self):
+        if self.is_initialized:
+            self.keys = torch.tensor([], dtype=self.dtype, device=self.device)
+            self.values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self._comp_keys = None
+        self._comp_values = None
+        self._comp_len = 0
+
+
+class TurboQuantCache(Cache):
+    """
+    HuggingFace Cache with TurboQuant KV compression.
+
+    Uses TurboQuantLayer for compressed layers and DynamicLayer for
+    skipped layers (first/last N layers kept at full precision).
+
+    Memory savings are realized between generation steps:
+    only compressed data + small buffer persist in GPU memory.
+    """
+
+    def __init__(self, head_dim, num_layers, key_bits=4, value_bits=4,
+                 buffer_size=256, value_group_size=32,
+                 skip_first_layers=0, skip_last_layers=0):
+        compress_set = set(range(skip_first_layers, num_layers - skip_last_layers))
+
+        layers = []
+        for i in range(num_layers):
+            if i in compress_set:
+                layers.append(TurboQuantLayer(
+                    head_dim=head_dim,
+                    key_bits=key_bits,
+                    value_bits=value_bits,
+                    buffer_size=buffer_size,
+                    value_group_size=value_group_size,
+                    seed=42 + i * 7,
+                ))
+            else:
+                layers.append(DynamicLayer())
+
+        super().__init__(layers=layers)
+
+        self.head_dim = head_dim
+        self.num_layers = num_layers
+        self.key_bits = key_bits
+        self.value_bits = value_bits
+        self.buffer_size = buffer_size
+        self.value_group_size = value_group_size
+        self.skip_first = skip_first_layers
+        self.skip_last = skip_last_layers
 
     def memory_report(self):
         """Report memory usage: compressed vs full precision equivalent."""
         compressed_bytes = 0
         buffer_bytes = 0
-        seq_len = self.get_seq_length(0) if len(self.key_cache) > 0 else 0
+        seq_len = self.get_seq_length(0)
         num_kv_heads = 0
         compressed_layers = 0
         full_layers = 0
 
-        for li in range(min(self.num_layers, len(self.key_cache))):
-            kc = self.key_cache[li]
-            if not isinstance(kc, list):
-                if num_kv_heads == 0:
-                    num_kv_heads = kc.shape[1]
-                buffer_bytes += kc.nelement() * 2   # bf16
-                buffer_bytes += self.value_cache[li].nelement() * 2
+        for li, layer in enumerate(self.layers):
+            if isinstance(layer, TurboQuantLayer):
+                if layer.is_initialized and layer.keys.numel() > 0:
+                    if num_kv_heads == 0:
+                        num_kv_heads = layer.keys.shape[1]
+                    buffer_bytes += layer.keys.nelement() * 2    # bf16
+                    buffer_bytes += layer.values.nelement() * 2
 
-            if li in self._comp_keys:
-                compressed_layers += 1
-                kq = self._comp_keys[li]
-                compressed_bytes += kq.mse_indices.nelement()        # uint8
-                compressed_bytes += kq.qjl_signs.nelement()          # uint8
-                compressed_bytes += kq.residual_norms.nelement() * 2  # fp16
-                compressed_bytes += kq.norms.nelement() * 2           # fp16
-                vq = self._comp_values[li]
-                compressed_bytes += vq.data.nelement()                # uint8
-                compressed_bytes += vq.scales.nelement() * 2          # fp16
-                compressed_bytes += vq.zeros.nelement() * 2           # fp16
-            else:
+                if layer._comp_keys is not None:
+                    compressed_layers += 1
+                    kq = layer._comp_keys
+                    compressed_bytes += kq.mse_indices.nelement()
+                    compressed_bytes += kq.qjl_signs.nelement()
+                    compressed_bytes += kq.residual_norms.nelement() * 2
+                    compressed_bytes += kq.norms.nelement() * 2
+                    vq = layer._comp_values
+                    compressed_bytes += vq.data.nelement()
+                    compressed_bytes += vq.scales.nelement() * 2
+                    compressed_bytes += vq.zeros.nelement() * 2
+                else:
+                    full_layers += 1
+            elif isinstance(layer, DynamicLayer):
                 full_layers += 1
+                if layer.is_initialized and layer.keys.numel() > 0:
+                    if num_kv_heads == 0:
+                        num_kv_heads = layer.keys.shape[1]
+                    buffer_bytes += layer.keys.nelement() * 2
+                    buffer_bytes += layer.values.nelement() * 2
 
-        # Find actual compressed token count from any compressed layer
-        comp_tokens = max(self._comp_lens.values()) if self._comp_lens else 0
+        comp_tokens = max(
+            (l._comp_len for l in self.layers if isinstance(l, TurboQuantLayer)),
+            default=0,
+        )
 
         actual = compressed_bytes + buffer_bytes
         full = self.num_layers * 2 * num_kv_heads * seq_len * self.head_dim * 2
@@ -646,9 +719,12 @@ def load_model():
     """Load Qwen3-BEST model and tokenizer in bfloat16."""
     print("[Model] Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH, device_map="auto", dtype=torch.bfloat16,
+        MODEL_PATH,
+        device_map="auto",
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
     )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     print(f"[Model] Loaded on {model.device}, dtype={model.dtype}")
     return model, tokenizer
 
@@ -665,7 +741,7 @@ def llm_stream(model, tokenizer, conversation, use_tq=True):
         model: HuggingFace model
         tokenizer: HuggingFace tokenizer
         conversation: list of message dicts
-        use_tq: if True, use TurboQuantCache; otherwise use default DynamicCache
+        use_tq: if True, use TurboQuantCache; otherwise use default cache
 
     Returns:
         dict with reasoning, content, usage stats, timing, and memory report
@@ -677,6 +753,7 @@ def llm_stream(model, tokenizer, conversation, use_tq=True):
         add_generation_prompt=True, enable_thinking=True,
     )
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    input_len = inputs["input_ids"].shape[-1]
 
     # Create cache
     if use_tq:
@@ -698,22 +775,17 @@ def llm_stream(model, tokenizer, conversation, use_tq=True):
 
     # Streaming setup
     buffer = StringIO()
-    CHUNK_SIZE = 10
 
     class CapturingStreamer(TextStreamer):
         def __init__(self, tokenizer, buf):
             super().__init__(tokenizer, skip_prompt=True, skip_special_tokens=True)
             self.buf = buf
-            self.accumulated = ""
             self.token_count = 0
 
         def on_finalized_text(self, text, stream_end=False):
             self.buf.write(text)
-            self.accumulated += text
             self.token_count += 1
-            if self.token_count % CHUNK_SIZE == 0 or stream_end:
-                print(self.accumulated, end="", flush=True)
-                self.accumulated = ""
+            print(text, end="", flush=True)
 
     streamer = CapturingStreamer(tokenizer, buffer)
 
@@ -732,30 +804,38 @@ def llm_stream(model, tokenizer, conversation, use_tq=True):
         gen_kwargs["past_key_values"] = cache
 
     with torch.inference_mode():
-        model.generate(**gen_kwargs)
+        output_ids = model.generate(**gen_kwargs)
 
-    # Flush remaining streamer buffer
-    if streamer.accumulated:
-        print(streamer.accumulated, end="", flush=True)
     print()  # newline after stream
+
+    # Count actual generated tokens
+    total_tokens = output_ids.shape[-1] - input_len
 
     response = buffer.getvalue()
     time_taken = time.time() - start_time
 
-    # Parse thinking/content
+    # Parse thinking/content — strip <think> and </think> tags
     if "</think>" in response:
         parts = response.rsplit("</think>", 1)
         reasoning = parts[0].strip()
+        # Strip leading <think> tag from reasoning
+        if reasoning.startswith("<think>"):
+            reasoning = reasoning[len("<think>"):].strip()
         content = parts[1].strip()
     else:
         reasoning = ""
         content = response.strip()
+        # Strip <think> if present but no </think> (incomplete thinking)
+        if content.startswith("<think>"):
+            content = content[len("<think>"):].strip()
 
-    # Approximate token counts
-    char_per_token = 3.245
-    reasoning_tokens = round(len(reasoning) / char_per_token)
-    content_tokens = round(len(content) / char_per_token)
-    total_tokens = reasoning_tokens + content_tokens
+    # Token counts from actual output
+    reasoning_tokens = 0
+    content_tokens = total_tokens
+    if reasoning:
+        # Estimate split between reasoning and content tokens
+        reasoning_tokens = len(tokenizer.encode(reasoning, add_special_tokens=False))
+        content_tokens = total_tokens - reasoning_tokens
 
     # Memory report
     mem_report = cache.memory_report() if use_tq and cache is not None else {}
@@ -859,6 +939,8 @@ def self_test():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import sys
+
     os.makedirs("./OUT", exist_ok=True)
 
     # Step 1: Self-test quantization
@@ -868,33 +950,81 @@ if __name__ == "__main__":
 
     # Step 2: Load model
     model, tokenizer = load_model()
-    messages = [{"role": "user", "content": INPUT_MESSAGE}]
 
-    # Step 3: Run with TurboQuant cache
-    print("\n" + "=" * 60)
-    print("Inference with TurboQuant KV Cache")
-    print("=" * 60 + "\n")
+    # Step 3: Check for interactive mode vs single-shot
+    interactive = "--interactive" in sys.argv or "-i" in sys.argv
 
-    ret = llm_stream(model, tokenizer, messages, use_tq=True)
+    if interactive:
+        # Multi-turn interactive chat
+        print("\n" + "=" * 60)
+        print("TurboQuant Interactive Chat (type 'quit' or 'exit' to stop)")
+        print("=" * 60 + "\n")
 
-    print("\n" + "-" * 60)
-    print("Results:")
-    print(f"  Total tokens: {ret['usage']['total_tokens']}")
-    print(f"  Time: {ret['time_taken']:.2f}s")
-    if ret["usage"]["total_tokens"] > 0 and ret["time_taken"] > 0:
-        tps = ret["usage"]["total_tokens"] / ret["time_taken"]
-        print(f"  Tokens/sec: {tps:.2f}")
+        messages = []
+        turn = 0
+        while True:
+            try:
+                user_input = input("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n[Exiting]")
+                break
 
-    if ret["tq_memory"]:
-        m = ret["tq_memory"]
-        print(f"\n  TurboQuant Memory Report:")
-        print(f"    Sequence length:    {m['seq_len']}")
-        print(f"    Compressed tokens:  {m['compressed_tokens']}")
-        print(f"    Buffer tokens:      {m['buffer_tokens']}")
-        print(f"    Compressed layers:  {m['compressed_layers']}")
-        print(f"    Full prec. layers:  {m['full_precision_layers']}")
-        print(f"    Actual KV cache:    {m['actual_mb']:.2f} MB")
-        print(f"    Full precision:     {m['full_precision_mb']:.2f} MB")
-        print(f"    Compression ratio:  {m['ratio']:.2f}x")
-        print(f"    Savings:            {m['savings_mb']:.2f} MB")
-    print("-" * 60)
+            if not user_input:
+                continue
+            if user_input.lower() in ("quit", "exit"):
+                print("[Exiting]")
+                break
+
+            messages.append({"role": "user", "content": user_input})
+            turn += 1
+
+            print(f"\n[Turn {turn}]")
+            print("Assistant: ", end="", flush=True)
+
+            ret = llm_stream(model, tokenizer, messages, use_tq=True)
+
+            # Add assistant response to conversation history
+            messages.append({"role": "assistant", "content": ret["content"]})
+
+            # Print stats
+            print(f"\n  [{ret['usage']['total_tokens']} tokens, "
+                  f"{ret['time_taken']:.1f}s, "
+                  f"{ret['usage']['total_tokens'] / ret['time_taken']:.1f} tok/s]")
+
+            if ret["tq_memory"]:
+                m = ret["tq_memory"]
+                print(f"  [KV: {m['actual_mb']:.1f}MB / {m['full_precision_mb']:.1f}MB, "
+                      f"{m['ratio']:.2f}x compression]")
+            print()
+
+    else:
+        # Single-shot inference
+        messages = [{"role": "user", "content": INPUT_MESSAGE}]
+
+        print("\n" + "=" * 60)
+        print("Inference with TurboQuant KV Cache")
+        print("=" * 60 + "\n")
+
+        ret = llm_stream(model, tokenizer, messages, use_tq=True)
+
+        print("\n" + "-" * 60)
+        print("Results:")
+        print(f"  Total tokens: {ret['usage']['total_tokens']}")
+        print(f"  Time: {ret['time_taken']:.2f}s")
+        if ret["usage"]["total_tokens"] > 0 and ret["time_taken"] > 0:
+            tps = ret["usage"]["total_tokens"] / ret["time_taken"]
+            print(f"  Tokens/sec: {tps:.2f}")
+
+        if ret["tq_memory"]:
+            m = ret["tq_memory"]
+            print(f"\n  TurboQuant Memory Report:")
+            print(f"    Sequence length:    {m['seq_len']}")
+            print(f"    Compressed tokens:  {m['compressed_tokens']}")
+            print(f"    Buffer tokens:      {m['buffer_tokens']}")
+            print(f"    Compressed layers:  {m['compressed_layers']}")
+            print(f"    Full prec. layers:  {m['full_precision_layers']}")
+            print(f"    Actual KV cache:    {m['actual_mb']:.2f} MB")
+            print(f"    Full precision:     {m['full_precision_mb']:.2f} MB")
+            print(f"    Compression ratio:  {m['ratio']:.2f}x")
+            print(f"    Savings:            {m['savings_mb']:.2f} MB")
+        print("-" * 60)
