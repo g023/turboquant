@@ -42,12 +42,14 @@ torch.cuda.empty_cache()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 MODEL_PATH = "./Qwen3-BEST"
-MAX_NEW_TOKENS = 8192
-TEMPERATURE = 0.6
+MAX_NEW_TOKENS = 1024  # Reduced for chat (was 8192)
+TEMPERATURE = 0.7      # Increased for more variety (was 0.6)
 DO_SAMPLE = True
 TOP_P = 0.95
 TOP_K = 20
-REPETITION_PENALTY = 1.1
+REPETITION_PENALTY = 1.2  # Increased to reduce repetition (was 1.1)
+MAX_CONVERSATION_TURNS = 20
+MAX_CONVERSATION_TOKENS = 8000
 INPUT_MESSAGE = (
     "You are completing the next step in a task to create an arcade game in javascript. "
     "Your available tools are rationalize, red_green_tdd, and create_plan. "
@@ -854,7 +856,46 @@ def llm_stream(model, tokenizer, conversation, use_tq=True):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Section 12: Quantization Self-Test
+# Section 12: Conversation Management
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def truncate_conversation(messages, tokenizer, max_tokens=MAX_CONVERSATION_TOKENS):
+    """
+    Truncate conversation to stay within token limits.
+    Keeps the system prompt (if any) and most recent messages.
+    """
+    if not messages:
+        return messages
+
+    # Calculate token counts for each message
+    message_tokens = []
+    for msg in messages:
+        content = msg.get("content", "")
+        tokens = len(tokenizer.encode(content, add_special_tokens=False))
+        message_tokens.append((msg, tokens))
+
+    total_tokens = sum(tokens for _, tokens in message_tokens)
+
+    if total_tokens <= max_tokens:
+        return messages
+
+    # Keep the first message (often system prompt) and truncate from the middle
+    truncated = [message_tokens[0][0]]  # Keep first message
+    remaining_tokens = max_tokens - message_tokens[0][1]
+
+    # Add messages from the end until we hit the limit
+    for msg, tokens in reversed(message_tokens[1:]):
+        if remaining_tokens - tokens >= 0:
+            truncated.insert(1, msg)  # Insert before the end
+            remaining_tokens -= tokens
+        else:
+            break
+
+    return truncated
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section 13: Quantization Self-Test
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def self_test():
@@ -958,10 +999,13 @@ if __name__ == "__main__":
         # Multi-turn interactive chat
         print("\n" + "=" * 60)
         print("TurboQuant Interactive Chat (type 'quit' or 'exit' to stop)")
+        print(f"Max turns: {MAX_CONVERSATION_TURNS}, Max tokens: {MAX_CONVERSATION_TOKENS}")
         print("=" * 60 + "\n")
 
         messages = []
         turn = 0
+        total_tokens_used = 0
+
         while True:
             try:
                 user_input = input("You: ").strip()
@@ -971,31 +1015,55 @@ if __name__ == "__main__":
 
             if not user_input:
                 continue
-            if user_input.lower() in ("quit", "exit"):
+            if user_input.lower() in ("quit", "exit", "q"):
                 print("[Exiting]")
                 break
 
             messages.append({"role": "user", "content": user_input})
             turn += 1
 
+            # Check turn limit
+            if turn > MAX_CONVERSATION_TURNS:
+                print(f"\n[Conversation limit reached ({MAX_CONVERSATION_TURNS} turns)]")
+                print("[Starting new conversation]")
+                messages = [{"role": "user", "content": user_input}]
+                turn = 1
+                total_tokens_used = 0
+
+            # Truncate conversation if needed
+            messages = truncate_conversation(messages, tokenizer, MAX_CONVERSATION_TOKENS)
+
             print(f"\n[Turn {turn}]")
             print("Assistant: ", end="", flush=True)
 
-            ret = llm_stream(model, tokenizer, messages, use_tq=True)
+            try:
+                ret = llm_stream(model, tokenizer, messages, use_tq=True)
 
-            # Add assistant response to conversation history
-            messages.append({"role": "assistant", "content": ret["content"]})
+                # Add assistant response to conversation history
+                messages.append({"role": "assistant", "content": ret["content"]})
 
-            # Print stats
-            print(f"\n  [{ret['usage']['total_tokens']} tokens, "
-                  f"{ret['time_taken']:.1f}s, "
-                  f"{ret['usage']['total_tokens'] / ret['time_taken']:.1f} tok/s]")
+                # Update token tracking
+                total_tokens_used += ret["usage"]["total_tokens"]
 
-            if ret["tq_memory"]:
-                m = ret["tq_memory"]
-                print(f"  [KV: {m['actual_mb']:.1f}MB / {m['full_precision_mb']:.1f}MB, "
-                      f"{m['ratio']:.2f}x compression]")
-            print()
+                # Print stats
+                print(f"\n  [{ret['usage']['total_tokens']} tokens, "
+                      f"{ret['time_taken']:.1f}s, "
+                      f"{ret['usage']['total_tokens'] / ret['time_taken']:.1f} tok/s, "
+                      f"total: {total_tokens_used}]")
+
+                if ret["tq_memory"]:
+                    m = ret["tq_memory"]
+                    print(f"  [KV: {m['actual_mb']:.1f}MB / {m['full_precision_mb']:.1f}MB, "
+                          f"{m['ratio']:.2f}x compression]")
+                print()
+
+            except Exception as e:
+                print(f"\n[Error during generation: {e}]")
+                print("[Continuing...]")
+                # Remove the failed user message to avoid loop
+                messages.pop()
+                turn -= 1
+                continue
 
     else:
         # Single-shot inference
