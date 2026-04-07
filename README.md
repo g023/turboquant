@@ -38,6 +38,7 @@ pip install transformers datasets scipy
 - TurboQuant KV cache compression (~1.55x memory savings)
 - 4-bit key quantization (3-bit MSE + 1-bit QJL residual)
 - 4-bit value quantization (group min-max)
+- Mirostat V2 sampling (arXiv:2007.14966v2) for controlled perplexity and reduced repetition
 - Qwen3 thinking mode support (automatic `<think>` tag parsing)
 - Multi-turn interactive chat mode (`-i` / `--interactive`)
 - Streaming output with real-time token display
@@ -46,29 +47,33 @@ pip install transformers datasets scipy
 - Pre-computed Lloyd-Max codebooks (cached in ./codebooks/)
 
 # generation parameters:
-Uses model-recommended settings from generation_config.json:
-- temperature: 0.6
-- top_k: 20
-- top_p: 0.95
-- repetition_penalty: 1.1
+Custom sampling with Mirostat V2 (arXiv:2007.14966v2) for controlled perplexity:
+- temperature: 0.7 (applied before Mirostat)
+- mirostat_tau: 5.0 (target surprise, -ln p)
+- mirostat_eta: 0.1 (learning rate for mu adaptation)
+- repetition_penalty: 1.2 (multiplicative, windowed)
+- frequency_penalty: 0.15 (additive, scales with token count in window)
+- presence_penalty: 0.15 (additive, flat per unique token in window)
+- rep_penalty_window: 256 (tokens to consider for penalties)
 
 # results (RTX 3060, single-shot):
 ~~~
 ------------------------------------------------------------
 Results:
-  Total tokens: ~1178
-  Time: ~26s
-  Tokens/sec: ~45
+  Total tokens: 1040
+  Time: 24.79s
+  Perplexity: 1.33
+  Tokens/sec: 41.95
 
   TurboQuant Memory Report:
-    Sequence length:    1225
+    Sequence length:    1087
     Compressed tokens:  771
-    Buffer tokens:      454
+    Buffer tokens:      316
     Compressed layers:  24
     Full prec. layers:  5
-    Actual KV cache:    89.64 MB
-    Full precision:     138.77 MB
-    Compression ratio:  1.55x
+    Actual KV cache:    74.01 MB
+    Full precision:     123.14 MB
+    Compression ratio:  1.66x
     Savings:            49.13 MB
 ------------------------------------------------------------
 ~~~
