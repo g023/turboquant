@@ -12,6 +12,8 @@ Algorithms:
   3. QJL sign-bit residual correction → unbiased inner products
   4. Group quantization for values → per-group min-max
 
+  # added Mirostat V2 sampling (arXiv:2007.14966v2) to assist in getting rid of the model repetition issues
+
 Model Repo: https://huggingface.co/g023/Qwen3-1.77B-g023
 Model Info: (head_dim=128, 8 KV heads, 29 layers, GQA)
 Model Instructions: Download files from 'MODEL REPO' and throw in ./Qwen3-BEST and then run this program. 
@@ -43,18 +45,23 @@ torch.cuda.empty_cache()
 
 MODEL_PATH = "./Qwen3-BEST"
 MAX_NEW_TOKENS = 8192  # Increased for longer chat responses (was 1024)
-TEMPERATURE = 0.7      # Increased for more variety (was 0.6)
-DO_SAMPLE = True
-TOP_P = 0.95
-TOP_K = 20
-REPETITION_PENALTY = 1.2  # Increased to reduce repetition (was 1.1)
+TEMPERATURE = 0.7      # Temperature scaling applied before Mirostat V2
+REPETITION_PENALTY = 1.2  # Multiplicative penalty on tokens seen in window
+REP_PENALTY_WINDOW = 256  # Only penalise tokens in the last N generated tokens
+FREQUENCY_PENALTY = 0.15  # Additive penalty scaled by count within window
+PRESENCE_PENALTY = 0.15   # Flat additive penalty for any token present in window
 MAX_CONVERSATION_TURNS = 20
-MAX_CONVERSATION_TOKENS = 45000 # Limit total tokens in conversation history to prevent OOM (was 8000, increased for testing)
+MAX_CONVERSATION_TOKENS = 45000 # Limit total tokens in conversation history to prevent OOM
 INPUT_MESSAGE = (
     "You are completing the next step in a task to create an arcade game in javascript. "
     "Your available tools are rationalize, red_green_tdd, and create_plan. "
     "Synthesize their output when reasoning."
 )
+
+# Mirostat V2 parameters  (arXiv:2007.14966v2)
+MIROSTAT = 2
+MIROSTAT_TAU = 5.0   # target surprise (−ln p); llama.cpp default is 5.0
+MIROSTAT_ETA = 0.1   # learning rate; llama.cpp default is 0.1
 
 # TurboQuant parameters
 TQ_KEY_BITS = 4            # 3 MSE + 1 QJL (near-lossless for head_dim=128)
@@ -64,6 +71,51 @@ TQ_VALUE_GROUP_SIZE = 32   # Group size for value quantization
 TQ_SKIP_FIRST_LAYERS = 3   # Keep first N layers full precision (critical for attention)
 TQ_SKIP_LAST_LAYERS = 2    # Keep last N layers full precision (critical for output)
 CODEBOOK_DIR = "./codebooks"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Mirostat V2 Sampling  (arXiv:2007.14966v2, Basu et al.) [https://arxiv.org/abs/2007.14966]
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def mirostat_v2_sample(logits, mu, tau, eta):
+    """
+    Mirostat V2 — surprise-based adaptive truncation (§3.2 of arXiv:2007.14966).
+
+    Instead of a fixed top-k or top-p, we keep all tokens whose *surprise*
+    (= −ln p) is ≤ the running estimate *mu*.  After sampling we nudge mu
+    toward the target surprise *tau* with learning-rate *eta*.
+
+    Args:
+        logits : [vocab_size] raw logits (1-D, already squeezed)
+        mu     : current surprise estimate (scalar float)
+        tau    : target surprise  (hyperparameter)
+        eta    : learning rate    (hyperparameter)
+
+    Returns:
+        token_id  : int
+        new_mu    : float   (updated estimate for next step)
+    """
+    # --- probabilities -------------------------------------------------------
+    probs = F.softmax(logits, dim=-1)                       # [V]
+    surprises = -torch.log(probs + 1e-10)                   # [V]
+
+    # --- adaptive truncation -------------------------------------------------
+    # keep every token whose surprise ≤ mu  (i.e. prob ≥ exp(-mu))
+    mask = surprises <= mu                                   # [V]
+    if mask.sum() == 0:                                      # safety: keep best
+        mask[probs.argmax()] = True
+
+    masked_probs = probs * mask.float()
+    masked_probs = masked_probs / masked_probs.sum()         # re-normalise
+
+    # --- sample --------------------------------------------------------------
+    idx = torch.multinomial(masked_probs, 1).item()
+
+    # --- update mu -----------------------------------------------------------
+    token_surprise = surprises[idx].item()
+    new_mu = mu - eta * (token_surprise - tau)
+
+    return idx, new_mu
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -789,29 +841,96 @@ def llm_stream(model, tokenizer, conversation, use_tq=True):
             self.token_count += 1
             print(text, end="", flush=True)
 
-    streamer = CapturingStreamer(tokenizer, buffer)
-
-    # Generate
-    gen_kwargs = dict(
-        **inputs,
-        max_new_tokens=MAX_NEW_TOKENS,
-        temperature=TEMPERATURE,
-        do_sample=DO_SAMPLE,
-        top_p=TOP_P,
-        top_k=TOP_K,
-        repetition_penalty=REPETITION_PENALTY,
-        streamer=streamer,
-    )
-    if cache is not None:
-        gen_kwargs["past_key_values"] = cache
+    # ── Mirostat V2 generation loop ────────────────────────────────────────
+    mu = 2.0 * MIROSTAT_TAU                    # initial surprise estimate
+    generated_tokens = []
+    past_kv = cache                             # TurboQuantCache (or None)
+    cur_ids = inputs["input_ids"]               # [1, prompt_len]
+    cur_mask = inputs.get("attention_mask")     # [1, prompt_len]
+    prompt_len = cur_ids.shape[1]
+    all_token_ids = cur_ids[0].tolist()         # flat list for rep-penalty
+    log_probs = []
 
     with torch.inference_mode():
-        output_ids = model.generate(**gen_kwargs)
+        for step in range(MAX_NEW_TOKENS):
+            out = model(
+                input_ids=cur_ids,
+                attention_mask=cur_mask,
+                past_key_values=past_kv,
+            )
+            logits = out.logits[:, -1, :].squeeze(0)       # [V]
+            past_kv = out.past_key_values
+
+            # ── temperature ──
+            logits = logits / TEMPERATURE
+
+            # ── repetition / frequency / presence penalty (windowed) ──
+            if REPETITION_PENALTY != 1.0 or FREQUENCY_PENALTY != 0 or PRESENCE_PENALTY != 0:
+                window = all_token_ids[-REP_PENALTY_WINDOW:]
+                if window:
+                    ids_t = torch.tensor(window, device=logits.device, dtype=torch.long)
+                    uniq, counts = ids_t.unique(return_counts=True)
+                    sel = logits[uniq].float()      # promote to f32 for math
+                    # multiplicative (presence-style, like llama.cpp repeat_penalty)
+                    if REPETITION_PENALTY != 1.0:
+                        sel = torch.where(sel < 0,
+                                          sel * REPETITION_PENALTY,
+                                          sel / REPETITION_PENALTY)
+                    # additive frequency penalty  (scales with count)
+                    if FREQUENCY_PENALTY != 0:
+                        sel = sel - FREQUENCY_PENALTY * counts.float()
+                    # additive presence penalty   (flat per unique token)
+                    if PRESENCE_PENALTY != 0:
+                        sel = sel - PRESENCE_PENALTY
+                    logits[uniq] = sel.to(logits.dtype)
+
+            # ── Mirostat V2 sample ──
+            token_id, mu = mirostat_v2_sample(logits, mu, MIROSTAT_TAU,
+                                              MIROSTAT_ETA)
+
+            generated_tokens.append(token_id)
+            all_token_ids.append(token_id)
+
+            # ── perplexity bookkeeping ──
+            p = F.softmax(logits, dim=-1)
+            log_probs.append(math.log(p[token_id].item() + 1e-10))
+
+            # ── stream one token at a time ──
+            # We decode the growing generated tail so the tokenizer can
+            # handle multi-token characters / BPE merges correctly.
+            decoded_so_far = tokenizer.decode(generated_tokens,
+                                              skip_special_tokens=True)
+            # Only print the *new* text since last decode
+            if step == 0:
+                _prev_decoded = ""
+            new_text = decoded_so_far[len(_prev_decoded):]
+            if new_text:
+                print(new_text, end="", flush=True)
+                buffer.write(new_text)
+            _prev_decoded = decoded_so_far
+
+            # ── prepare next step: send ONLY the new token ──
+            cur_ids = torch.tensor([[token_id]], device=inputs["input_ids"].device)
+            if cur_mask is not None:
+                cur_mask = torch.cat(
+                    [cur_mask,
+                     torch.ones((1, 1), device=cur_mask.device,
+                                dtype=cur_mask.dtype)],
+                    dim=1)
+
+            # ── stop on EOS ──
+            if token_id == tokenizer.eos_token_id:
+                break
 
     print()  # newline after stream
 
-    # Count actual generated tokens
-    total_tokens = output_ids.shape[-1] - input_len
+    total_tokens = len(generated_tokens)
+
+    # Perplexity
+    if log_probs:
+        perplexity = math.exp(-sum(log_probs) / len(log_probs))
+    else:
+        perplexity = float('inf')
 
     response = buffer.getvalue()
     time_taken = time.time() - start_time
@@ -849,6 +968,7 @@ def llm_stream(model, tokenizer, conversation, use_tq=True):
             "reasoning_tokens": reasoning_tokens,
             "content_tokens": content_tokens,
             "total_tokens": total_tokens,
+            "perplexity": perplexity,
         },
         "time_taken": time_taken,
         "tq_memory": mem_report,
@@ -1079,6 +1199,7 @@ if __name__ == "__main__":
         print("Results:")
         print(f"  Total tokens: {ret['usage']['total_tokens']}")
         print(f"  Time: {ret['time_taken']:.2f}s")
+        print(f"  Perplexity: {ret['usage']['perplexity']:.2f}")
         if ret["usage"]["total_tokens"] > 0 and ret["time_taken"] > 0:
             tps = ret["usage"]["total_tokens"] / ret["time_taken"]
             print(f"  Tokens/sec: {tps:.2f}")
