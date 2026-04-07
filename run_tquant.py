@@ -42,14 +42,14 @@ torch.cuda.empty_cache()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 MODEL_PATH = "./Qwen3-BEST"
-MAX_NEW_TOKENS = 1024  # Reduced for chat (was 8192)
+MAX_NEW_TOKENS = 8192  # Increased for longer chat responses (was 1024)
 TEMPERATURE = 0.7      # Increased for more variety (was 0.6)
 DO_SAMPLE = True
 TOP_P = 0.95
 TOP_K = 20
 REPETITION_PENALTY = 1.2  # Increased to reduce repetition (was 1.1)
 MAX_CONVERSATION_TURNS = 20
-MAX_CONVERSATION_TOKENS = 8000
+MAX_CONVERSATION_TOKENS = 45000 # Limit total tokens in conversation history to prevent OOM (was 8000, increased for testing)
 INPUT_MESSAGE = (
     "You are completing the next step in a task to create an arcade game in javascript. "
     "Your available tools are rationalize, red_green_tdd, and create_plan. "
