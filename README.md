@@ -1,5 +1,6 @@
 # turboquant
-Standalone TurboQuant KV Cache Inference for https://huggingface.co/g023/Qwen3-1.77B-g023
+Standalone TurboQuant KV Cache Inference 
+Example uses: https://huggingface.co/g023/Qwen3-1.77B-g023 for demonstration
 
 ~~~
 run_tquant.py — Standalone TurboQuant KV Cache Inference for https://huggingface.co/g023/Qwen3-1.77B-g023
